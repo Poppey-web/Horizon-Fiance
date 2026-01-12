@@ -26,11 +26,13 @@ def should_update_stocks(last_update):
     """Détermine si on doit mettre à jour les actions"""
     if not last_update:
         return True
-    if not is_market_open():
-        return False  # Pas de MAJ si marché fermé
+    # On vérifie juste le temps écoulé, pas les heures de marché
+    # Le marché est vérifié ailleurs si nécessaire
     try:
         last = datetime.fromisoformat(last_update)
-        return (datetime.now() - last).seconds > 300  # 5 min si marché ouvert
+        elapsed = (datetime.now() - last).total_seconds()
+        # Mise à jour toutes les 5 minutes max
+        return elapsed > 300
     except:
         return True
 
@@ -40,7 +42,8 @@ def should_update_crypto(last_update):
         return True
     try:
         last = datetime.fromisoformat(last_update)
-        return (datetime.now() - last).seconds > 3600  # 1 heure
+        elapsed = (datetime.now() - last).total_seconds()
+        return elapsed > 3600  # 1 heure
     except:
         return True
 
@@ -75,32 +78,56 @@ def get_crypto_prices():
     return None
 
 def get_stock_prices(tickers):
+    """Récupère les prix des actions avec gestion robuste des erreurs"""
     prices = {}
+    if not tickers:
+        return prices
     try:
         import yfinance as yf
         for ticker in tickers:
             try:
-                data = yf.download(ticker, period="5d", interval="1d", progress=False)
-                if not data.empty:
-                    price = float(data['Close'].iloc[-1])
-                    if len(data) > 1:
-                        prev = float(data['Close'].iloc[-2])
-                        change = ((price - prev) / prev) * 100
-                    else:
-                        change = 0
-                    prices[ticker] = {"price": price, "change": change}
-            except:
+                data = yf.download(ticker, period="5d", interval="1d", progress=False, auto_adjust=True)
+                if data.empty:
+                    continue
+                
+                # Gérer le format MultiIndex si présent
+                if isinstance(data.columns, pd.MultiIndex):
+                    data.columns = data.columns.get_level_values(0)
+                
+                # S'assurer que 'Close' existe
+                if 'Close' not in data.columns:
+                    continue
+                
+                close_prices = data['Close'].dropna()
+                if len(close_prices) < 1:
+                    continue
+                
+                price = float(close_prices.iloc[-1])
+                if len(close_prices) > 1:
+                    prev = float(close_prices.iloc[-2])
+                    change = ((price - prev) / prev) * 100 if prev > 0 else 0
+                else:
+                    change = 0
+                
+                prices[ticker] = {"price": price, "change": change}
+            except Exception as e:
+                st.sidebar.warning(f"⚠️ Erreur {ticker}: {str(e)[:30]}")
                 continue
     except ImportError:
-        st.sidebar.warning("⚠️ yfinance non installé")
+        st.sidebar.error("⚠️ yfinance non installé: pip install yfinance")
     return prices
 
 def get_forex_rate():
+    """Récupère le taux EUR/USD"""
     try:
         import yfinance as yf
         fx = yf.download("EURUSD=X", period="1d", interval="1d", progress=False)
         if not fx.empty:
-            return 1 / float(fx['Close'].iloc[-1])
+            # Gérer MultiIndex
+            if isinstance(fx.columns, pd.MultiIndex):
+                fx.columns = fx.columns.get_level_values(0)
+            if 'Close' in fx.columns:
+                return 1 / float(fx['Close'].iloc[-1])
     except:
         pass
     return 0.92
@@ -231,8 +258,9 @@ def update_prices(data, force=False):
     taux = get_forex_rate()
     data["taux_usd_eur"] = taux
     
-    # CRYPTO - toutes les heures
-    if force or should_update_crypto(data.get("last_update_crypto")):
+    # CRYPTO - toutes les heures (ou force)
+    should_crypto = force or should_update_crypto(data.get("last_update_crypto"))
+    if should_crypto:
         crypto_prices = get_crypto_prices()
         if crypto_prices:
             for c in data["crypto"]:
@@ -241,16 +269,20 @@ def update_prices(data, force=False):
                     c["change_24h"] = crypto_prices[c["ticker"]]["change"]
             data["last_update_crypto"] = datetime.now().isoformat()
     
-    # BOURSE - seulement si marché ouvert
-    if force or should_update_stocks(data.get("last_update_stocks")):
+    # BOURSE - si force=True, on ignore la condition marché ouvert
+    should_stocks = force or should_update_stocks(data.get("last_update_stocks"))
+    if should_stocks and data["bourse"]:
         tickers = [p["ticker"] for p in data["bourse"]]
         stock_prices = get_stock_prices(tickers)
         if stock_prices:
+            updated_count = 0
             for p in data["bourse"]:
                 if p["ticker"] in stock_prices:
                     p["prix_actuel"] = stock_prices[p["ticker"]]["price"]
                     p["change_24h"] = stock_prices[p["ticker"]]["change"]
-            data["last_update_stocks"] = datetime.now().isoformat()
+                    updated_count += 1
+            if updated_count > 0:
+                data["last_update_stocks"] = datetime.now().isoformat()
     
     # IMMOBILIER - tous les mois (intérêts)
     if force or should_update_immo(data.get("last_update_immo")):
@@ -740,17 +772,27 @@ div[data-testid="stMetric"] {
 # ============== INIT ==============
 if 'data' not in st.session_state:
     st.session_state.data = load_data()
+    st.session_state.needs_update = True
+else:
+    st.session_state.needs_update = False
+
 if 'page' not in st.session_state:
     st.session_state.page = "📊 Dashboard"
 if 'force_refresh' not in st.session_state:
     st.session_state.force_refresh = False
 
+# Mise à jour des prix
 data = st.session_state.data
-data = update_prices(data, st.session_state.force_refresh)
+if st.session_state.force_refresh or st.session_state.needs_update:
+    with st.spinner("🔄 Mise à jour des prix..."):
+        data = update_prices(data, force=True)
+    st.session_state.force_refresh = False
+else:
+    data = update_prices(data, force=False)
+
 data = calc_values(data)
 save_data(data)
 st.session_state.data = data
-st.session_state.force_refresh = False
 
 # ============== CALCULS GLOBAUX ==============
 taux = data.get("taux_usd_eur", 0.92)
